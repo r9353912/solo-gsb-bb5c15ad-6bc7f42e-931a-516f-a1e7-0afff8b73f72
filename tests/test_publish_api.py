@@ -287,3 +287,414 @@ def test_publish_and_verify_in_openapi(client: TestClient) -> None:
     assert "/redact/publish" in schema["paths"]
     assert "/redact/publish/{credential_id}/verify" in schema["paths"]
     assert schema["paths"]["/redact/publish"]["post"]["tags"] == ["脱敏发布凭证"]
+
+
+# ---------------------------------------------------------------------------
+# 便携核验包：导出
+# ---------------------------------------------------------------------------
+
+
+def _publish_n(client: TestClient, n: int) -> list[dict]:
+    results = []
+    for i in range(n):
+        resp = publish(
+            client,
+            {
+                "text": f"原文编号{i}内容",
+                "fragments": [
+                    {"id": 1, "weight": 1, "start": 0, "end": 2},
+                    {"id": 2, "weight": 1, "start": 2, "end": 4},
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        results.append(resp.json())
+    return results
+
+
+def test_export_returns_ordered_package(client: TestClient) -> None:
+    published = _publish_n(client, 3)
+    resp = client.get("/redact/publish/3/export")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["tail_seq"] == 3
+    assert [r["seq"] for r in data["records"]] == [1, 2, 3]
+    first = data["records"][0]
+    assert set(first) == {"seq", "masked_text", "ranges", "text_digest", "chain_value"}
+    assert first["masked_text"] == "████0内容"
+    assert first["ranges"] == [[0, 2], [2, 4]]
+    assert first["chain_value"] == published[0]["chain_value"]
+    salt, digest = first["text_digest"].split("$")
+    assert len(salt) == 64 and len(digest) == 64
+
+    # 前缀导出 1..2
+    resp = client.get("/redact/publish/2/export")
+    assert [r["seq"] for r in resp.json()["records"]] == [1, 2]
+
+
+def test_export_unknown_id_returns_404(client: TestClient) -> None:
+    _publish_n(client, 1)
+    resp = client.get("/redact/publish/2/export")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "凭证不存在"}
+    resp = client.get("/redact/publish/0/export")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "凭证不存在"}
+
+
+def test_export_non_integer_id_rejected(client: TestClient) -> None:
+    resp = client.get("/redact/publish/abc/export")
+    assert resp.status_code == 422
+
+
+def test_export_package_contains_no_plaintext(client: TestClient) -> None:
+    secret = "机密原文绝不导出到包里"
+    publish(
+        client,
+        {
+            "text": secret,
+            "fragments": [{"id": 1, "weight": 1, "start": 0, "end": len(secret)}],
+        },
+    )
+    resp = client.get("/redact/publish/1/export")
+    blob = resp.content
+    assert secret.encode("utf-8") not in blob
+    assert "绝不导出".encode("utf-8") not in blob
+    assert resp.json()["records"][0]["masked_text"] == "█" * len(secret)
+
+
+# ---------------------------------------------------------------------------
+# 便携核验包：离线核验
+# ---------------------------------------------------------------------------
+
+
+def _export(client: TestClient, seq: int) -> dict:
+    resp = client.get(f"/redact/publish/{seq}/export")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _verify_package(client: TestClient, package: object, chain_value: object):
+    return client.post(
+        "/redact/publish/verify-package",
+        json={"package": package, "chain_value": chain_value},
+    )
+
+
+def test_verify_package_roundtrip_valid(client: TestClient) -> None:
+    published = _publish_n(client, 3)
+    package = _export(client, 3)
+    resp = _verify_package(client, package, published[-1]["chain_value"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "credential_id": 3,
+        "valid": True,
+        "first_broken_id": None,
+        "chain_value_matches": True,
+        "server_chain_value": published[-1]["chain_value"],
+    }
+
+    # 前缀包凭发布编号 2 时留存的链值核验
+    prefix = _export(client, 2)
+    resp = _verify_package(client, prefix, published[1]["chain_value"])
+    assert resp.json()["valid"] is True
+    assert resp.json()["credential_id"] == 2
+
+
+def test_verify_package_shuffled_order_still_valid(client: TestClient) -> None:
+    published = _publish_n(client, 3)
+    package = _export(client, 3)
+    package["records"] = list(reversed(package["records"]))
+    resp = _verify_package(client, package, published[-1]["chain_value"])
+    assert resp.status_code == 200
+    assert resp.json()["valid"] is True
+    assert resp.json()["first_broken_id"] is None
+
+
+def test_verify_package_wrong_saved_chain_value(client: TestClient) -> None:
+    _publish_n(client, 2)
+    package = _export(client, 2)
+    resp = _verify_package(client, package, "f" * 64)
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["valid"] is False
+    assert body["first_broken_id"] is None  # 链本身完整，只是留存值不符
+    assert body["chain_value_matches"] is False
+    assert body["server_chain_value"] == package["records"][-1]["chain_value"]
+
+
+def test_verify_package_detects_missing_record(client: TestClient) -> None:
+    published = _publish_n(client, 3)
+    package = _export(client, 3)
+    package["records"] = [
+        r for r in package["records"] if r["seq"] != 2
+    ]
+    resp = _verify_package(client, package, published[-1]["chain_value"])
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["valid"] is False
+    assert body["first_broken_id"] == 2
+
+    # 缺失末端记录：server_chain_value 为 null
+    package = _export(client, 3)
+    package["records"] = [
+        r for r in package["records"] if r["seq"] != 3
+    ]
+    body = _verify_package(client, package, published[-1]["chain_value"]).json()
+    assert body["first_broken_id"] == 3
+    assert body["server_chain_value"] is None
+    assert body["valid"] is False
+
+
+def test_verify_package_detects_tampered_content(client: TestClient) -> None:
+    published = _publish_n(client, 3)
+    package = _export(client, 3)
+    package["records"][1]["masked_text"] = "被篡改的遮盖正文"
+    body = _verify_package(client, package, published[-1]["chain_value"]).json()
+    assert body["valid"] is False
+    assert body["first_broken_id"] == 2
+
+
+def test_verify_package_detects_tampered_chain_value(client: TestClient) -> None:
+    published = _publish_n(client, 2)
+    package = _export(client, 2)
+    package["records"][0]["chain_value"] = "a" * 64
+    body = _verify_package(client, package, published[-1]["chain_value"]).json()
+    assert body["valid"] is False
+    assert body["first_broken_id"] == 1
+
+
+def test_verify_package_detects_tampered_ranges(client: TestClient) -> None:
+    published = _publish_n(client, 2)
+    package = _export(client, 2)
+    package["records"][1]["ranges"] = [[2, 4], [0, 2]]
+    body = _verify_package(client, package, published[-1]["chain_value"]).json()
+    assert body["first_broken_id"] == 2
+    assert body["valid"] is False
+
+
+def test_verify_package_detects_duplicate_seq(client: TestClient) -> None:
+    published = _publish_n(client, 3)
+    package = _export(client, 3)
+    package["records"].append(dict(package["records"][0]))
+    body = _verify_package(client, package, published[-1]["chain_value"]).json()
+    assert body["valid"] is False
+    assert body["first_broken_id"] == 1
+
+
+def test_verify_package_does_not_touch_database(
+    client: TestClient, monkeypatch
+) -> None:
+    published = _publish_n(client, 2)
+    package = _export(client, 2)
+
+    # 核验期间任何 SQLite 连接尝试都应直接失败：证明接口不访问数据库。
+    def forbid_connect(*_args, **_kwargs):
+        raise AssertionError("verify-package 不应访问数据库")
+
+    monkeypatch.setattr(publishing.sqlite3, "connect", forbid_connect)
+    resp = _verify_package(client, package, published[-1]["chain_value"])
+    assert resp.status_code == 200
+    assert resp.json()["valid"] is True
+
+
+def test_verify_package_invalid_json_returns_400(client: TestClient) -> None:
+    resp = client.post(
+        "/redact/publish/verify-package",
+        content="{not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"package": {"tail_seq": 1, "records": []}},
+        {"chain_value": "a" * 64},
+        {"package": {"tail_seq": 1, "records": []}, "chain_value": "z" * 64},
+        {"package": {"tail_seq": 1, "records": []}, "chain_value": "A" * 64},
+        {"package": {"tail_seq": 1, "records": []}, "chain_value": "a" * 63},
+        {"package": {"tail_seq": 1, "records": []}, "chain_value": 123},
+        # 包结构错误
+        {"package": [], "chain_value": "a" * 64},
+        {"package": {"records": []}, "chain_value": "a" * 64},
+        {"package": {"tail_seq": 0, "records": []}, "chain_value": "a" * 64},
+        {"package": {"tail_seq": -1, "records": []}, "chain_value": "a" * 64},
+        {"package": {"tail_seq": True, "records": []}, "chain_value": "a" * 64},
+        {"package": {"tail_seq": "2", "records": []}, "chain_value": "a" * 64},
+        {"package": {"tail_seq": 1, "records": {}}, "chain_value": "a" * 64},
+        # 记录字段错误
+        {
+            "package": {"tail_seq": 1, "records": [{}]},
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 0,
+                        "masked_text": "x",
+                        "ranges": [],
+                        "text_digest": f"{'b' * 64}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 2,
+                        "masked_text": "x",
+                        "ranges": [],
+                        "text_digest": f"{'b' * 64}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": 3,
+                        "ranges": [],
+                        "text_digest": f"{'b' * 64}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": "x",
+                        "ranges": [[0, 1, 2]],
+                        "text_digest": f"{'b' * 64}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": "x",
+                        "ranges": [[1, 1]],
+                        "text_digest": f"{'b' * 64}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": "x",
+                        "ranges": [["0", 1]],
+                        "text_digest": f"{'b' * 64}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": "x",
+                        "ranges": [],
+                        "text_digest": "not-a-digest",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": "x",
+                        "ranges": [],
+                        "text_digest": f"{'b' * 63}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": "x",
+                        "ranges": [],
+                        "text_digest": f"{'B' * 64}${'c' * 64}",
+                        "chain_value": "d" * 64,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+        {
+            "package": {
+                "tail_seq": 1,
+                "records": [
+                    {
+                        "seq": 1,
+                        "masked_text": "x",
+                        "ranges": [],
+                        "text_digest": f"{'b' * 64}${'c' * 64}",
+                        "chain_value": "d" * 63,
+                    }
+                ],
+            },
+            "chain_value": "a" * 64,
+        },
+    ],
+)
+def test_verify_package_malformed_returns_400(
+    client: TestClient, payload: object
+) -> None:
+    resp = client.post("/redact/publish/verify-package", json=payload)
+    assert resp.status_code == 400, resp.text
+    assert "detail" in resp.json()
+
+
+def test_export_and_verify_package_in_openapi(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    assert "/redact/publish/{credential_id}/export" in schema["paths"]
+    assert "/redact/publish/verify-package" in schema["paths"]
+    export_path = schema["paths"]["/redact/publish/{credential_id}/export"]
+    verify_path = schema["paths"]["/redact/publish/verify-package"]
+    assert export_path["get"]["tags"] == ["脱敏发布凭证"]
+    assert verify_path["post"]["tags"] == ["脱敏发布凭证"]

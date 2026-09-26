@@ -20,6 +20,11 @@ sort_keys=True, separators=(",", ":"))`` 的 UTF-8 字节，字段集合固定�
 
 发布在单条 SQLite 事务中以 ``BEGIN IMMEDIATE`` 立即获取写锁，
 配合 ``busy_timeout``，使并发请求的编号与链顺序严格串行一致。
+
+``GET /redact/publish/{id}/export`` 在单个 SQLite 读事务内导出
+``1..id`` 的**便携核验包**（编号、遮盖正文、入选区间、带盐原文摘要、
+链值；不含原文），``POST /redact/publish/verify-package`` 则完全不
+访问数据库，仅凭包与客户端另存的末端链值重算哈希链完成核验。
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ import os
 import secrets
 import sqlite3
 from dataclasses import dataclass
+from typing import Sequence
 
 # 创世链值：第一条凭证的“前一链值”，不写入数据库。
 GENESIS_CHAIN_VALUE = "0" * 64
@@ -52,6 +58,36 @@ class StoredCredential:
     ranges: tuple[tuple[int, int], ...]
     text_digest: str
     chain_value: str
+
+
+@dataclass(frozen=True)
+class PackageRecord:
+    """便携核验包中的一条凭证记录（字段与库存记录一致，不含原文）。"""
+
+    seq: int
+    masked_text: str
+    ranges: tuple[tuple[int, int], ...]
+    text_digest: str
+    chain_value: str
+
+
+@dataclass(frozen=True)
+class ExportPackage:
+    """``GET .../{tail_seq}/export`` 导出的便携核验包：``1..tail_seq`` 的有序记录。"""
+
+    tail_seq: int
+    records: tuple[PackageRecord, ...]
+
+
+@dataclass(frozen=True)
+class PackageVerification:
+    """离线核验包的结果（核验过程不访问数据库）。"""
+
+    tail_seq: int
+    valid: bool
+    first_broken_id: int | None
+    chain_value_matches: bool
+    server_chain_value: str | None
 
 
 def db_path() -> str:
@@ -268,3 +304,126 @@ def first_chain_break(
     if expected <= tail_seq:
         return expected
     return None
+
+
+def export_package_through(
+    tail_seq: int, path: str | None = None
+) -> ExportPackage | None:
+    """在单个 SQLite 读事务内导出 ``1..tail_seq`` 的有序核验包。
+
+    使用 ``BEGIN`` 延迟事务包住“末端存在性检查 + 全量有序读取”：
+    读事务期间 WAL 快照固定，即便恰好有并发发布提交，导出的仍是同一
+    一致视图，不会出现“末端存在但中间缺失”的撕裂结果。
+
+    ``tail_seq`` 不存在（含 0 或负数）时返回 ``None``，由上层转 404。
+    包内仅含编号、遮盖正文、入选区间、带盐原文摘要与链值，**不含原文**。
+    """
+    path = path or db_path()
+    conn = _connect(path)
+    try:
+        conn.execute("BEGIN")
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM redaction_publish WHERE seq = ?", (tail_seq,)
+            ).fetchone()
+            if exists is None:
+                package = None
+            else:
+                rows = conn.execute(
+                    "SELECT seq, masked_text, ranges_json, text_digest, chain_value "
+                    "FROM redaction_publish WHERE seq <= ? ORDER BY seq ASC",
+                    (tail_seq,),
+                ).fetchall()
+                package = ExportPackage(
+                    tail_seq=tail_seq,
+                    records=tuple(
+                        PackageRecord(
+                            seq=credential.seq,
+                            masked_text=credential.masked_text,
+                            ranges=credential.ranges,
+                            text_digest=credential.text_digest,
+                            chain_value=credential.chain_value,
+                        )
+                        for credential in (_row_to_credential(row) for row in rows)
+                    ),
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+    return package
+
+
+def first_package_chain_break(
+    records: Sequence[PackageRecord], tail_seq: int
+) -> int | None:
+    """离线重算核验包内 ``1..tail_seq`` 的哈希链，返回首个断裂编号。
+
+    与 :func:`first_chain_break` 规则一致，另覆盖“包内编号重复”
+    （同编号出现两份记录）这类包级异常（编号超出 ``tail_seq`` 的记录在
+    HTTP 层已作为格式错误拒绝，本函数同样跳过它们不计入链）：
+
+    - 缺号或顺序异常：断裂编号为第一个缺失/错位的编号；
+    - 编号重复：断裂编号为该重复编号（取最小者）；
+    - 内容或链值被改动，致重算链值与包内链值不符：断裂编号为该条记录；
+    - 全部一致返回 ``None``。
+
+    本函数纯计算，不访问数据库。
+    """
+    # 先按编号排序，确保缺号检查不受包内排列顺序影响；编号必须唯一。
+    ordered = sorted(records, key=lambda r: r.seq)
+    prev_chain_value = GENESIS_CHAIN_VALUE
+    expected = 1
+    for index, record in enumerate(ordered):
+        if record.seq > tail_seq:
+            break
+        if record.seq != expected:
+            return expected
+        # 与后一条编号相同即编号重复（内容相同的重复也按断裂处理）。
+        if index + 1 < len(ordered) and ordered[index + 1].seq == record.seq:
+            return record.seq
+        recomputed = compute_chain_value(
+            record.seq,
+            record.masked_text,
+            record.ranges,
+            record.text_digest,
+            prev_chain_value,
+        )
+        if not secrets.compare_digest(recomputed, record.chain_value):
+            return record.seq
+        prev_chain_value = record.chain_value
+        expected += 1
+    if expected <= tail_seq:
+        return expected
+    return None
+
+
+def verify_package(
+    package: ExportPackage, expected_tail_chain_value: str
+) -> PackageVerification:
+    """不访问数据库，仅凭核验包与客户端另存的末端链值完成核验。
+
+    按发布规范从创世链值起对包内记录逐条重算哈希链；缺号、编号重复或
+    内容、链值被改动时返回首个断裂编号。只有链完整 **且** 包内末端
+    （编号 ``tail_seq``）链值与客户端留存值相符时 ``valid=True``。
+    """
+    broken = first_package_chain_break(package.records, package.tail_seq)
+    by_seq = {record.seq: record for record in package.records}
+    tail_record = by_seq.get(package.tail_seq)
+    # 断裂时无法按链重算出有意义的尾链值；若末端记录本身在包内，
+    # 直接给出其包内链值供排查，否则为 None（包连末端都缺失）。
+    server_chain_value = tail_record.chain_value if tail_record is not None else None
+    chain_value_matches = (
+        broken is None
+        and tail_record is not None
+        and secrets.compare_digest(tail_record.chain_value, expected_tail_chain_value)
+    )
+    return PackageVerification(
+        tail_seq=package.tail_seq,
+        valid=chain_value_matches,
+        first_broken_id=broken,
+        chain_value_matches=chain_value_matches,
+        server_chain_value=server_chain_value,
+    )

@@ -9,7 +9,11 @@
 `POST /redact` 相同的校验与选段规则发布**脱敏凭证**，仅持久化遮盖正文、
 入选区间与带随机盐的原文 SHA-256 摘要（**不保存原文**），凭证串成
 SHA-256 哈希链，客户端留存链值后可随时经
-`GET /redact/publish/{id}/verify` 核验档案是否被改动。
+`GET /redact/publish/{id}/verify` 核验档案是否被改动；也可用
+`GET /redact/publish/{id}/export` 导出从 1 到该编号的**便携核验包**
+（同样不含原文），交由 `POST /redact/publish/verify-package`
+**完全离线**（不访问数据库）重算哈希链完成核验，便于把凭证包带到
+脱离服务端的环境独立验证。
 
 ## 一条命令启动
 
@@ -19,16 +23,26 @@ SHA-256 哈希链，客户端留存链值后可随时经
 docker compose up --build
 ```
 
-服务地址与端口：
+后台运行可加 `-d`，停止使用 `docker compose down`。
+
+访问地址固定为 **`http://localhost:8000`**：
 
 - API 地址：`http://localhost:8000`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互文档（Swagger UI）：`http://localhost:8000/docs`
 - OpenAPI 描述：`http://localhost:8000/openapi.json`
 
-后台运行可加 `-d`，停止使用 `docker compose down`。
+#### 必要配置
 
-访问端口固定为宿主机 **8000**（`http://localhost:8000`）。
+本服务**无需任何外部账号、密钥或第三方服务**，开箱即用；
+`Dockerfile` 与 `docker-compose.yml` 已内置全部配置，`docker compose up --build`
+一条命令即可启动。可调整项只有：
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| 监听端口 | `8000` | 容器内 `uvicorn --host 0.0.0.0 --port 8000`；宿主机由 compose 映射 `8000:8000`，改宿主端口可把 compose 中 `"8000:8000"` 改为 `"<宿主端口>:8000"` |
+| `REDACTION_DB_PATH` | `/data/redaction.db`（容器内） | 凭证 SQLite 数据库路径；仅这一个环境变量，compose 已设置 |
+
 脱敏凭证写入 SQLite 数据库并保存在 Docker **命名卷 `redaction-data`**
 （容器内 `/data/redaction.db`）中：`docker compose down`、重建镜像、
 重启容器都不会丢失凭证链；仅当显式删除卷
@@ -407,6 +421,128 @@ curl -s 'http://localhost:8000/redact/publish/1/verify?chain_value=d47320fae8f27
 - 服务端档案被改动或缺失：`valid=false`，`first_broken_id` 指向
   **首个**出问题的编号；断裂点之前的旧凭证仍可单独核验通过。
 
+### `GET /redact/publish/{id}/export`
+
+在**单个 SQLite 读事务**内导出从第 1 条到第 `id` 条的全部凭证，组成
+可离线携带的**便携核验包**。读事务保证导出期间视图一致：即使恰好有并发
+发布提交，包里的记录也来自同一快照，不会出现撕裂或新旧混排。
+
+包内每条记录只包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `seq` | 凭证编号（1..`id`，按编号升序） |
+| `masked_text` | 遮盖正文 |
+| `ranges` | 入选码点区间 `[start, end)` |
+| `text_digest` | 带随机盐的原文 SHA-256 摘要 |
+| `chain_value` | 该凭证的库存链值 |
+
+**包内不包含原文**——服务端本来就不保存原文，导出的只是库存的
+遮盖正文、区间、加盐摘要与链值。路径参数 `id` 不存在（含 0、负数或
+超出当前最大编号）时返回 HTTP 404。
+
+返回体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `tail_seq` | 包的末端凭证编号（即路径中的 `id`） |
+| `records` | 编号 1..`tail_seq` 的有序凭证记录，按编号升序 |
+
+示例：
+
+```bash
+curl -s http://localhost:8000/redact/publish/2/export
+```
+
+响应（`text_digest`、`chain_value` 为示意值）：
+
+```json
+{
+  "tail_seq": 2,
+  "records": [
+    {
+      "seq": 1,
+      "masked_text": "███世界！",
+      "ranges": [[0, 3]],
+      "text_digest": "0123...abcd$d47320fae8f27cbfea41b6528c6215e790d5fe6b26f9d5e3bb949ff63a778b8a",
+      "chain_value": "d47320fae8f27cbfea41b6528c6215e790d5fe6b26f9d5e3bb949ff63a778b8a"
+    },
+    {
+      "seq": 2,
+      "masked_text": "██████",
+      "ranges": [[0, 3], [3, 6]],
+      "text_digest": "9876...fedc$7e5e8d2c0b9f4a613d7c5e90b2f84a1d6c3b0e9715f2a48d3c6b190f7e5d2a4",
+      "chain_value": "7e5e8d2c0b9f4a613d7c5e90b2f84a1d6c3b0e9715f2a48d3c6b190f7e5d2a4"
+    }
+  ]
+}
+```
+
+可直接把响应体保存为文件，连同发布时另存的末端链值一起带走：
+
+```bash
+curl -s http://localhost:8000/redact/publish/2/export -o package.json
+```
+
+### `POST /redact/publish/verify-package`
+
+接收便携核验包与**客户端另存的末端链值**，**全程不访问数据库**，
+按与发布完全相同的规范从创世链值（64 个 `0`）起，对包内记录
+逐条重算 SHA-256 哈希链：
+
+- 缺号（含末端记录缺失）、编号重复、遮盖正文/入选区间/加盐摘要或
+  包内链值被改动：`valid=false`，`first_broken_id` 指向**首个**
+  断裂编号；
+- 只有链完整 **且** 包内末端链值等于客户端另存链值时 `valid=true`。
+
+记录允许乱序提交（服务端按编号重排后重算）；但编号必须唯一且都在
+`1..tail_seq` 范围内，任何结构/类型/格式错误返回 HTTP 400。
+
+请求体（`Content-Type: application/json`）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `package` | object | **必填**，`GET .../export` 返回的核验包，原样回传 |
+| `package.tail_seq` | integer | 包的末端凭证编号，正整数 |
+| `package.records` | array | 凭证记录数组；每条须含 `seq`、`masked_text`、`ranges`、`text_digest`、`chain_value` |
+| `chain_value` | string | **必填**，客户端发布时另存的编号 `tail_seq` 链值（64 位小写十六进制）；缺失或格式错误返回 HTTP 400 |
+
+返回体（HTTP 200）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `credential_id` | 包的末端凭证编号（`package.tail_seq`） |
+| `valid` | 链完整且末端链值与留存值一致时为 `true` |
+| `first_broken_id` | 首个断裂编号（缺号/重复编号，或内容、链值被改动）；无断裂为 `null` |
+| `chain_value_matches` | 包内末端链值是否等于客户端留存链值 |
+| `server_chain_value` | 包内末端凭证的链值（链断裂时即为包内值，便于排查）；末端记录缺失时为 `null` |
+
+示例（用上面导出的包与发布编号 2 时另存的链值）：
+
+```bash
+curl -s http://localhost:8000/redact/publish/verify-package \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"package\": $(cat package.json),
+    \"chain_value\": \"7e5e8d2c0b9f4a613d7c5e90b2f84a1d6c3b0e9715f2a48d3c6b190f7e5d2a4\"
+  }"
+# {"credential_id":2,"valid":true,"first_broken_id":null,
+#  "chain_value_matches":true,"server_chain_value":"7e5e...d2a4"}
+```
+
+核验不通过的两种情形与在线核验一致：
+
+- 另存链值写错、包本身完整：`valid=false`、`first_broken_id=null`、
+  `chain_value_matches=false`；
+- 包被改动或记录缺失：`valid=false`，`first_broken_id` 指向首个
+  出问题的编号；例如删掉 `seq=2` 的记录后核验 `tail_seq=3` 的包，
+  返回 `"first_broken_id": 2`。
+
+结构错误（缺字段、`tail_seq` 非正整数、区间不是两个非负整数且
+`start < end`、`text_digest` 不符合 `"<64 hex>$<64 hex>"`、
+链值不是 64 位小写十六进制等）一律返回 HTTP 400，形如
+`{"detail": "中文错误说明"}`；请求体不是合法 JSON 同样返回 400。
+
 ## 码点计数说明
 
 位置与遮盖均以 **Unicode 码点**为单位（即 Python 3 中 `str` 的索引与
@@ -427,9 +563,9 @@ pytest -q                                    # 运行测试
 ```
 
 测试包含核心算法（选择、预算选择、遮盖、编辑应用、片段迁移）单元测试、
-脱敏发布凭证（加盐摘要、哈希链重算、篡改检出、SQLite 并发编号一致性）
-单元测试，以及各 API 端点的端到端测试，另含各 300 组随机用例下
-动态规划结果与 2^n 暴力枚举（含带预算版本）的对照校验。
+脱敏发布凭证（加盐摘要、哈希链重算、篡改检出、SQLite 并发编号一致性、
+便携核验包导出与离线重算）单元测试，以及各 API 端点的端到端测试，另含各
+300 组随机用例下动态规划结果与 2^n 暴力枚举（含带预算版本）的对照校验。
 
 本地运行时凭证数据库默认在工作目录的 `data/redaction.db`，
 可用环境变量 `REDACTION_DB_PATH` 覆盖（容器内固定为 `/data/redaction.db`，

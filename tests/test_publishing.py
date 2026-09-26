@@ -198,6 +198,231 @@ def test_get_credential_missing_returns_none(db: str) -> None:
     assert publishing.get_credential(1, path=db) is None
 
 
+# ---------------------------------------------------------------------------
+# 便携核验包：导出与离线核验
+# ---------------------------------------------------------------------------
+
+
+def _publish_n(db: str, count: int) -> list[publishing.StoredCredential]:
+    credentials: list[publishing.StoredCredential] = []
+    for i in range(count):
+        text = f"原文编号{i}!"
+        masked = "█" + text[1:]
+        credentials.append(
+            publishing.publish_credential(
+                masked,
+                [(0, 1)],
+                publishing.salted_text_digest(text),
+                path=db,
+            )
+        )
+    return credentials
+
+
+def test_export_returns_ordered_records_through_tail(db: str) -> None:
+    credentials = _publish_n(db, 3)
+    package = publishing.export_package_through(3, path=db)
+    assert package is not None
+    assert package.tail_seq == 3
+    assert [r.seq for r in package.records] == [1, 2, 3]
+    for record, credential in zip(package.records, credentials):
+        assert isinstance(record, publishing.PackageRecord)
+        assert record.seq == credential.seq
+        assert record.masked_text == credential.masked_text
+        assert record.ranges == credential.ranges
+        assert record.text_digest == credential.text_digest
+        assert record.chain_value == credential.chain_value
+
+    # 可导出前缀：1..2
+    prefix = publishing.export_package_through(2, path=db)
+    assert prefix is not None
+    assert [r.seq for r in prefix.records] == [1, 2]
+
+
+def test_export_missing_tail_returns_none(db: str) -> None:
+    _publish_n(db, 2)
+    assert publishing.export_package_through(3, path=db) is None
+    assert publishing.export_package_through(999, path=db) is None
+    # 编号从 1 开始：0 与负数也视为不存在
+    assert publishing.export_package_through(0, path=db) is None
+    assert publishing.export_package_through(-1, path=db) is None
+
+
+def test_export_package_contains_no_plaintext(db: str) -> None:
+    text = "机密原文绝不导出"
+    publishing.publish_credential(
+        "██" + text[2:],
+        [(0, 2)],
+        publishing.salted_text_digest(text),
+        path=db,
+    )
+    package = publishing.export_package_through(1, path=db)
+    assert package is not None
+    serialized = json.dumps(
+        {
+            "tail_seq": package.tail_seq,
+            "records": [
+                {
+                    "seq": r.seq,
+                    "masked_text": r.masked_text,
+                    "ranges": [list(x) for x in r.ranges],
+                    "text_digest": r.text_digest,
+                    "chain_value": r.chain_value,
+                }
+                for r in package.records
+            ],
+        },
+        ensure_ascii=False,
+    )
+    assert "机密" not in serialized
+    _stored_raw_text_is_not_persisted(db, text)
+
+
+def test_verify_package_valid_with_client_tail_chain_value(db: str) -> None:
+    credentials = _publish_n(db, 3)
+    package = publishing.export_package_through(3, path=db)
+    assert package is not None
+    result = publishing.verify_package(package, credentials[-1].chain_value)
+    assert result.valid is True
+    assert result.first_broken_id is None
+    assert result.chain_value_matches is True
+    assert result.server_chain_value == credentials[-1].chain_value
+    assert result.tail_seq == 3
+
+    # 前缀包凭当时留存的末端链值同样通过
+    prefix = publishing.export_package_through(2, path=db)
+    assert prefix is not None
+    assert publishing.verify_package(prefix, credentials[1].chain_value).valid is True
+
+
+def test_verify_package_wrong_saved_value_but_intact(db: str) -> None:
+    _publish_n(db, 2)
+    package = publishing.export_package_through(2, path=db)
+    assert package is not None
+    result = publishing.verify_package(package, "f" * 64)
+    assert result.valid is False
+    assert result.first_broken_id is None
+    assert result.chain_value_matches is False
+    assert result.server_chain_value == package.records[-1].chain_value
+
+
+def test_verify_package_detects_gap(db: str) -> None:
+    credentials = _publish_n(db, 3)
+    package = publishing.export_package_through(3, path=db)
+    assert package is not None
+    # 删除第 2 条（缺号）
+    missing = tuple(r for r in package.records if r.seq != 2)
+    result = publishing.verify_package(
+        publishing.ExportPackage(3, missing), credentials[-1].chain_value
+    )
+    assert result.valid is False
+    assert result.first_broken_id == 2
+
+    # 删除末端记录：断裂点为 3，包内没有末端链值可回报
+    missing_tail = tuple(r for r in package.records if r.seq != 3)
+    result = publishing.verify_package(
+        publishing.ExportPackage(3, missing_tail), credentials[-1].chain_value
+    )
+    assert result.first_broken_id == 3
+    assert result.server_chain_value is None
+
+    # 空包：断裂点为 1
+    result = publishing.verify_package(
+        publishing.ExportPackage(3, ()), credentials[-1].chain_value
+    )
+    assert result.first_broken_id == 1
+    assert result.server_chain_value is None
+
+
+@pytest.mark.parametrize("tamper_seq", [1, 2, 3])
+def test_verify_package_detects_tampered_content(db: str, tamper_seq: int) -> None:
+    credentials = _publish_n(db, 3)
+    package = publishing.export_package_through(3, path=db)
+    assert package is not None
+    records = [
+        publishing.PackageRecord(
+            seq=r.seq,
+            masked_text="被篡改" if r.seq == tamper_seq else r.masked_text,
+            ranges=r.ranges,
+            text_digest=r.text_digest,
+            chain_value=r.chain_value,
+        )
+        for r in package.records
+    ]
+    result = publishing.verify_package(
+        publishing.ExportPackage(3, tuple(records)), credentials[-1].chain_value
+    )
+    assert result.first_broken_id == tamper_seq
+    assert result.valid is False
+
+
+def test_verify_package_detects_tampered_chain_value(db: str) -> None:
+    credentials = _publish_n(db, 2)
+    package = publishing.export_package_through(2, path=db)
+    assert package is not None
+    records = list(package.records)
+    records[1] = publishing.PackageRecord(
+        records[1].seq,
+        records[1].masked_text,
+        records[1].ranges,
+        records[1].text_digest,
+        "f" * 64,
+    )
+    result = publishing.verify_package(
+        publishing.ExportPackage(2, tuple(records)), credentials[-1].chain_value
+    )
+    assert result.first_broken_id == 2
+
+
+def test_verify_package_detects_reordered_ranges(db: str) -> None:
+    _publish_n(db, 1)
+    tail = publishing.publish_credential(
+        "██████",
+        [(0, 3), (3, 6)],
+        publishing.salted_text_digest("abcdef"),
+        path=db,
+    )
+    package = publishing.export_package_through(2, path=db)
+    assert package is not None
+    records = list(package.records)
+    tampered = records[-1]
+    records[-1] = publishing.PackageRecord(
+        tampered.seq,
+        tampered.masked_text,
+        ((3, 6), (0, 3)),  # 区间顺序被改动
+        tampered.text_digest,
+        tampered.chain_value,
+    )
+    result = publishing.verify_package(
+        publishing.ExportPackage(2, tuple(records)), tail.chain_value
+    )
+    assert result.first_broken_id == 2
+
+
+def test_verify_package_detects_duplicate_seq(db: str) -> None:
+    credentials = _publish_n(db, 3)
+    package = publishing.export_package_through(3, path=db)
+    assert package is not None
+    duplicated = (package.records[0],) + package.records
+    result = publishing.verify_package(
+        publishing.ExportPackage(3, duplicated), credentials[-1].chain_value
+    )
+    assert result.valid is False
+    assert result.first_broken_id == 1
+
+
+def test_verify_package_accepts_shuffled_order(db: str) -> None:
+    credentials = _publish_n(db, 3)
+    package = publishing.export_package_through(3, path=db)
+    assert package is not None
+    shuffled = publishing.ExportPackage(
+        3, tuple(reversed(package.records))
+    )
+    result = publishing.verify_package(shuffled, credentials[-1].chain_value)
+    assert result.valid is True
+    assert result.first_broken_id is None
+
+
 def test_init_db_is_idempotent(db: str) -> None:
     publishing.init_db(db)
     publishing.init_db(db)
