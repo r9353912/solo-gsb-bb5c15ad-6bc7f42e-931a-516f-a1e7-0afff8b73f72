@@ -238,6 +238,39 @@ def list_credentials_through(
     return [_row_to_credential(row) for row in rows]
 
 
+def export_credentials_through(
+    tail_seq: int, path: str | None = None
+) -> list[StoredCredential] | None:
+    """在一次 SQLite 读事务中导出 ``1..tail_seq`` 按编号升序的凭证。
+
+    整个导出包在同一个 ``BEGIN`` 读事务（WAL 快照）中读取，导出期间并发的
+    发布不会混入快照，保证包内记录来自同一时刻。编号 ``tail_seq`` 不存在时
+    返回 ``None``；中间有缺口（记录被删）时仍返回已存在的记录，
+    缺口由核验方（:func:`first_chain_break`）检出。
+    """
+    path = path or db_path()
+    conn = _connect(path)
+    try:
+        # 显式读事务：本函数只读，BEGIN（deferred）不会阻塞并发写入。
+        conn.execute("BEGIN")
+        try:
+            rows = conn.execute(
+                "SELECT seq, masked_text, ranges_json, text_digest, chain_value "
+                "FROM redaction_publish WHERE seq <= ? ORDER BY seq ASC",
+                (tail_seq,),
+            ).fetchall()
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+    # 记录按 seq 升序且均 <= tail_seq：末条即编号 tail_seq 的记录（若存在）。
+    if not rows or int(rows[-1][0]) != tail_seq:
+        return None
+    return [_row_to_credential(row) for row in rows]
+
+
 def first_chain_break(
     records: list[StoredCredential], tail_seq: int
 ) -> int | None:

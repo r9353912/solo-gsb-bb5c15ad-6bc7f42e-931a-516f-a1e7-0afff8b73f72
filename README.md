@@ -10,6 +10,10 @@
 入选区间与带随机盐的原文 SHA-256 摘要（**不保存原文**），凭证串成
 SHA-256 哈希链，客户端留存链值后可随时经
 `GET /redact/publish/{id}/verify` 核验档案是否被改动。
+还可经 `GET /redact/publish/{id}/export` 在单次 SQLite 读事务中导出
+第 1 至第 `id` 条的**便携核验包**（只含脱敏数据，不含原文），再用
+`POST /redact/publish/verify-package` 提交该包与客户端另存的末端链值，
+**不访问数据库**逐条重算哈希链做离线核验。
 
 ## 一条命令启动
 
@@ -38,6 +42,9 @@ docker compose up --build
 > 服务端不会替你另行备份。请在发布成功后**立即由客户端自行保存**
 > `credential_id` 与 `chain_value`（例如写入自己的台账），日后核验时
 > 原样传回即可。无需保存原文——服务端本来就不保存原文，只保存加盐摘要。
+> 需要离线核验或向第三方出示时，可再经
+> `GET /redact/publish/{id}/export` 导出便携核验包，连同留存的末端
+> 链值交给 `POST /redact/publish/verify-package` 核验。
 
 ## API
 
@@ -407,6 +414,114 @@ curl -s 'http://localhost:8000/redact/publish/1/verify?chain_value=d47320fae8f27
 - 服务端档案被改动或缺失：`valid=false`，`first_broken_id` 指向
   **首个**出问题的编号；断裂点之前的旧凭证仍可单独核验通过。
 
+### `GET /redact/publish/{id}/export`
+
+导出**便携核验包**：在一次 SQLite 读事务（WAL 快照，不阻塞并发发布）中
+取出第 1 条到第 `id` 条的全部凭证，按编号升序返回。包内只有脱敏数据——
+编号、遮盖正文、入选区间、带盐原文摘要与链值，**不含原文**；
+`id` 不存在时返回 HTTP 404。
+
+返回体（HTTP 200）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `through_seq` | 导出截止的凭证编号（即路径中的 `id`） |
+| `records` | 第 1 至第 `id` 条凭证记录，按编号升序 |
+| `records[].seq` | 凭证编号 |
+| `records[].masked_text` | 遮盖正文 |
+| `records[].ranges` | 入选码点区间 `[[start, end], ...]`，按起点升序 |
+| `records[].text_digest` | 带盐原文摘要 `"<盐 hex>$<摘要 hex>"` |
+| `records[].chain_value` | 该凭证链值（64 位十六进制 SHA-256） |
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/redact/publish/2/export
+```
+
+响应（摘要与链值因随机盐每次不同）：
+
+```json
+{
+  "through_seq": 2,
+  "records": [
+    {
+      "seq": 1,
+      "masked_text": "███世界！",
+      "ranges": [[0, 3]],
+      "text_digest": "15a5ec…（64 位盐 hex）$4e8ad3…（64 位摘要 hex）",
+      "chain_value": "f991122b2e18a9c20d9501246f6c7a81cc41c94f86529fc601824aaece343ff4"
+    },
+    {
+      "seq": 2,
+      "masked_text": "██████",
+      "ranges": [[0, 3], [3, 6]],
+      "text_digest": "021454…$bf9ab5…",
+      "chain_value": "f329f13aefe0185000cd1d61432d7729db739fe5cb31d783c7e252fd82b60dd3"
+    }
+  ]
+}
+```
+
+### `POST /redact/publish/verify-package`
+
+**离线核验**便携核验包：**不访问数据库**，按与发布时相同的规范从创世链值
+（64 个 `0`）起对包内记录逐条重算哈希链并逐一比对；链完整时再把第
+`through_seq` 条的链值与客户端**另存的末端链值**做恒定时间比较。
+适合把导出的包交给第三方独立核验，或服务端不可用时本地核验。
+
+请求体（`Content-Type: application/json`）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `package` | object | `GET /redact/publish/{id}/export` 返回的完整对象（含 `through_seq` 与 `records`） |
+| `tail_chain_value` | string | 客户端另存的末端链值，即发布第 `through_seq` 条时返回的 `chain_value`（64 位小写十六进制） |
+
+返回体（HTTP 200）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `through_seq` | 核验包声明的截止编号 |
+| `valid` | 链完整（无缺号、无篡改）**且**末端链值相符时为 `true` |
+| `first_broken_id` | 首个断裂编号：缺号（含尾部缺记录）为第一个缺失编号，内容或链值被改为该条编号；无断裂为 `null` |
+| `tail_chain_value_matches` | 重算末端链值与客户端留存值是否一致（链断裂时恒为 `false`） |
+
+格式错误一律返回 HTTP 400：请求体不是合法 JSON、缺少 `package` /
+`tail_chain_value` 或记录字段、类型错误（不接受布尔/浮点/字符串形式的
+编号与位置）、`tail_chain_value` 或记录 `chain_value` 不是 64 位小写
+十六进制、`records` 为空或条数超过 `through_seq` 等。
+
+#### 示例
+
+```bash
+# 导出核验包并保存到本地文件
+curl -s http://localhost:8000/redact/publish/2/export > package.json
+
+# 用发布第 2 条时留存的 chain_value 离线核验（jq 仅用于拼装请求体）
+curl -s http://localhost:8000/redact/publish/verify-package \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --argjson pkg "$(cat package.json)" \
+       --arg tail "f329f13aefe0185000cd1d61432d7729db739fe5cb31d783c7e252fd82b60dd3" \
+       '{package: $pkg, tail_chain_value: $tail}')"
+```
+
+响应：
+
+```json
+{
+  "through_seq": 2,
+  "valid": true,
+  "first_broken_id": null,
+  "tail_chain_value_matches": true
+}
+```
+
+与 `GET /redact/publish/{id}/verify` 的区别：`verify` 核验的是**服务端
+当前库存**的链；`verify-package` 核验的是**客户端手中导出的包**，
+服务端数据库完全不参与。包被改动时的表现与库存核验一致：缺号或内容、
+链值被改都会得到 `valid=false` 与首个断裂编号；只有链完整且末端链值
+与留存值相符才是 `valid=true`。
+
 ## 码点计数说明
 
 位置与遮盖均以 **Unicode 码点**为单位（即 Python 3 中 `str` 的索引与
@@ -428,7 +543,8 @@ pytest -q                                    # 运行测试
 
 测试包含核心算法（选择、预算选择、遮盖、编辑应用、片段迁移）单元测试、
 脱敏发布凭证（加盐摘要、哈希链重算、篡改检出、SQLite 并发编号一致性）
-单元测试，以及各 API 端点的端到端测试，另含各 300 组随机用例下
+单元测试、便携核验包导出与离线核验（缺号、篡改、末端链值不符、格式错误）
+端到端测试，以及各 API 端点的端到端测试，另含各 300 组随机用例下
 动态规划结果与 2^n 暴力枚举（含带预算版本）的对照校验。
 
 本地运行时凭证数据库默认在工作目录的 `data/redaction.db`，

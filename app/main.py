@@ -35,7 +35,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="敏感片段遮盖 API",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
     description=(
         "提交原文及候选片段（含唯一 ID、正整数权重、左闭右开码点区间），"
@@ -44,7 +44,10 @@ app = FastAPI(
         "也支持通过 /redact/budget 限定遮盖码点总预算。"
         "POST /redact/publish 可发布脱敏凭证：仅持久化遮盖正文、入选区间与"
         "加盐原文摘要（不保存原文），凭证串成 SHA-256 哈希链，"
-        "可经 /redact/publish/{id}/verify 凭客户端留存的链值核验。"
+        "可经 /redact/publish/{id}/verify 凭客户端留存的链值核验；"
+        "GET /redact/publish/{id}/export 在单次 SQLite 读事务中导出"
+        "1..id 的便携核验包（不含原文），POST /redact/publish/verify-package "
+        "不访问数据库即可对该包逐条重算哈希链做离线核验。"
     ),
 )
 
@@ -177,6 +180,83 @@ REVISE_REQUEST_SCHEMA = {
 # 复用 REDACT_REQUEST_SCHEMA 在 /docs 展示相同的请求结构。
 
 
+# /redact/publish/verify-package 的请求体 JSON Schema；实际校验由
+# validate_verify_package_payload 严格执行（不合法一律返回 400）。
+VERIFY_PACKAGE_REQUEST_SCHEMA = {
+    "type": "object",
+    "required": ["package", "tail_chain_value"],
+    "properties": {
+        "package": {
+            "type": "object",
+            "description": "GET /redact/publish/{id}/export 返回的完整核验包",
+            "required": ["through_seq", "records"],
+            "properties": {
+                "through_seq": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "核验包截止的凭证编号",
+                },
+                "records": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "从 1 到 through_seq 的有序凭证记录",
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "seq",
+                            "masked_text",
+                            "ranges",
+                            "text_digest",
+                            "chain_value",
+                        ],
+                        "properties": {
+                            "seq": {"type": "integer", "minimum": 1},
+                            "masked_text": {"type": "string"},
+                            "ranges": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 2,
+                                    "items": {"type": "integer", "minimum": 0},
+                                },
+                            },
+                            "text_digest": {"type": "string"},
+                            "chain_value": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}$",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "tail_chain_value": {
+            "type": "string",
+            "description": (
+                "客户端另存的末端链值：发布第 through_seq 条凭证时返回的 "
+                "chain_value（64 位小写十六进制 SHA-256）"
+            ),
+        },
+    },
+    "example": {
+        "package": {
+            "through_seq": 1,
+            "records": [
+                {
+                    "seq": 1,
+                    "masked_text": "███世界！",
+                    "ranges": [[0, 3]],
+                    "text_digest": "<64 位盐 hex>$<64 位摘要 hex>",
+                    "chain_value": "d47320fae8f27cbfea41b6528c6215e790d5fe6b26f9d5e3bb949ff63a778b8a",
+                }
+            ],
+        },
+        "tail_chain_value": "d47320fae8f27cbfea41b6528c6215e790d5fe6b26f9d5e3bb949ff63a778b8a",
+    },
+}
+
+
 class RedactOut(BaseModel):
     selected_ids: list[int | str] = Field(..., description="入选片段 ID（升序）")
     rejected_ids: list[int | str] = Field(..., description="落选片段 ID（升序）")
@@ -226,6 +306,39 @@ class VerifyOut(BaseModel):
     )
     server_chain_value: str = Field(
         ..., description="服务端截至该凭证的链值（重算结果或当前库存值）"
+    )
+
+
+class ExportRecordOut(BaseModel):
+    seq: int = Field(..., description="凭证编号")
+    masked_text: str = Field(..., description="遮盖正文")
+    ranges: list[list[int]] = Field(
+        ..., description="入选码点区间 [start, end)，按起点升序"
+    )
+    text_digest: str = Field(
+        ..., description='带盐原文摘要，形如 "<盐 hex>$<摘要 hex>"'
+    )
+    chain_value: str = Field(..., description="该凭证链值（64 位十六进制 SHA-256）")
+
+
+class ExportOut(BaseModel):
+    through_seq: int = Field(..., description="导出截止的凭证编号（即路径中的 id）")
+    records: list[ExportRecordOut] = Field(
+        ..., description="从 1 到 through_seq 按编号升序的凭证记录；包内不含原文"
+    )
+
+
+class VerifyPackageOut(BaseModel):
+    through_seq: int = Field(..., description="核验包声明的截止编号")
+    valid: bool = Field(
+        ..., description="链完整（无缺号、无篡改）且末端链值与客户端留存值一致时为 true"
+    )
+    first_broken_id: int | None = Field(
+        ...,
+        description="首个断裂编号：缺号为第一个缺失编号，内容或链值被改为该条编号；无断裂为 null",
+    )
+    tail_chain_value_matches: bool = Field(
+        ..., description="重算末端链值是否等于客户端留存链值（链断裂时恒为 false）"
     )
 
 
@@ -282,6 +395,116 @@ def validate_revise_payload(payload: Any) -> tuple[str, list[Fragment], list[Edi
         raise _bad("缺少字段：edits")
     edits = _validate_edits(text, payload["edits"])
     return text, fragments, edits
+
+
+def validate_verify_package_payload(
+    payload: Any,
+) -> tuple[int, list[publishing.StoredCredential], str]:
+    """严格校验 /redact/publish/verify-package 请求体。
+
+    返回 ``(through_seq, 记录列表, 末端链值)``；记录被整理为与库存凭证相同的
+    ``StoredCredential``，以便复用 :func:`publishing.first_chain_break`
+    按发布时的同一规范逐条重算。任何格式错误均抛出 ``ValueError``，
+    由上层转为 HTTP 400。
+    """
+    if not isinstance(payload, dict):
+        raise _bad("请求体必须是 JSON 对象，包含 package 与 tail_chain_value 字段")
+
+    if "package" not in payload:
+        raise _bad("缺少字段：package")
+    package = payload["package"]
+    if not isinstance(package, dict):
+        raise _bad("package 必须是对象（GET /redact/publish/{id}/export 的完整响应）")
+
+    if "through_seq" not in package:
+        raise _bad("package 缺少字段：through_seq")
+    through_seq = package["through_seq"]
+    if isinstance(through_seq, bool) or not isinstance(through_seq, int):
+        raise _bad("package.through_seq 必须是正整数")
+    if through_seq < 1:
+        raise _bad("package.through_seq 必须是正整数")
+
+    if "records" not in package:
+        raise _bad("package 缺少字段：records")
+    raw_records = package["records"]
+    if not isinstance(raw_records, list):
+        raise _bad("package.records 必须是数组")
+    if not raw_records:
+        raise _bad("package.records 不能为空")
+
+    records: list[publishing.StoredCredential] = []
+    for index, item in enumerate(raw_records):
+        where = f"package.records[{index}]"
+        if not isinstance(item, dict):
+            raise _bad(f"{where} 必须是对象")
+        for field in ("seq", "masked_text", "ranges", "text_digest", "chain_value"):
+            if field not in item:
+                raise _bad(f"{where} 缺少字段：{field}")
+
+        seq = item["seq"]
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise _bad(f"{where}.seq 必须是正整数")
+        if seq < 1:
+            raise _bad(f"{where}.seq 必须是正整数")
+
+        masked_text = item["masked_text"]
+        if not isinstance(masked_text, str):
+            raise _bad(f"{where}.masked_text 必须是字符串")
+
+        ranges = _validate_package_ranges(item["ranges"], where)
+
+        text_digest = item["text_digest"]
+        if not isinstance(text_digest, str):
+            raise _bad(f"{where}.text_digest 必须是字符串")
+
+        chain_value = item["chain_value"]
+        if not isinstance(chain_value, str) or not _is_hex64(chain_value):
+            raise _bad(f"{where}.chain_value 必须是 64 位小写十六进制 SHA-256 摘要")
+
+        records.append(
+            publishing.StoredCredential(
+                seq=seq,
+                masked_text=masked_text,
+                ranges=ranges,
+                text_digest=text_digest,
+                chain_value=chain_value,
+            )
+        )
+
+    if len(records) > through_seq:
+        raise _bad("package.records 的记录数超过 through_seq，包内容不一致")
+
+    if "tail_chain_value" not in payload:
+        raise _bad("缺少字段：tail_chain_value")
+    tail_chain_value = payload["tail_chain_value"]
+    if not isinstance(tail_chain_value, str) or not _is_hex64(tail_chain_value):
+        raise _bad("tail_chain_value 必须是 64 位小写十六进制 SHA-256 摘要")
+
+    return through_seq, records, tail_chain_value
+
+
+def _validate_package_ranges(
+    raw_ranges: Any, where: str
+) -> tuple[tuple[int, int], ...]:
+    """校验核验包记录的 ``ranges`` 字段，返回 ``((start, end), ...)``。"""
+    if not isinstance(raw_ranges, list):
+        raise _bad(f"{where}.ranges 必须是数组")
+    ranges: list[tuple[int, int]] = []
+    for range_index, item in enumerate(raw_ranges):
+        range_where = f"{where}.ranges[{range_index}]"
+        if not isinstance(item, list) or len(item) != 2:
+            raise _bad(f"{range_where} 必须是 [start, end] 形式的二元数组")
+        start, end = item
+        for name, value in (("start", start), ("end", end)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise _bad(f"{range_where} 的 {name} 必须是整数")
+        if start < 0 or end < start:
+            raise _bad(
+                f"{range_where} 区间非法：要求 0 <= start <= end，"
+                f"实际 start={start}, end={end}"
+            )
+        ranges.append((start, end))
+    return tuple(ranges)
 
 
 def _validate_text_and_fragments(payload: dict) -> tuple[str, list[Fragment]]:
@@ -598,6 +821,65 @@ async def verify_published(
         first_broken_id=broken,
         chain_value_matches=chain_value_matches,
         server_chain_value=server_chain_value,
+    )
+
+
+@app.get(
+    "/redact/publish/{credential_id}/export",
+    response_model=ExportOut,
+    tags=["脱敏发布凭证"],
+    summary="导出 1..id 的便携核验包（单次 SQLite 读事务，不含原文）",
+)
+async def export_published(credential_id: int) -> ExportOut:
+    # 整个导出在一次 SQLite 读事务（WAL 快照）中完成；库中本就不存原文，
+    # 因此包内只有编号、遮盖正文、入选区间、带盐摘要与链值。
+    records = await to_thread.run_sync(
+        publishing.export_credentials_through, credential_id
+    )
+    if records is None:
+        raise HTTPException(status_code=404, detail="凭证不存在")
+    return ExportOut(
+        through_seq=credential_id,
+        records=[
+            ExportRecordOut(
+                seq=record.seq,
+                masked_text=record.masked_text,
+                ranges=[[start, end] for start, end in record.ranges],
+                text_digest=record.text_digest,
+                chain_value=record.chain_value,
+            )
+            for record in records
+        ],
+    )
+
+
+@app.post(
+    "/redact/publish/verify-package",
+    response_model=VerifyPackageOut,
+    tags=["脱敏发布凭证"],
+    summary="离线核验便携核验包（不访问数据库）",
+    openapi_extra={"requestBody": {"content": {"application/json": {"schema": VERIFY_PACKAGE_REQUEST_SCHEMA}}}},
+)
+async def verify_package(request: Request) -> VerifyPackageOut:
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise _bad("请求体不是合法的 JSON")
+    through_seq, records, tail_chain_value = validate_verify_package_payload(payload)
+
+    # 纯内存重算，不访问数据库：从创世链值起按发布时的同一规范逐条重算，
+    # 缺号、内容或链值被改动都会体现为首个断裂编号。
+    broken = publishing.first_chain_break(records, through_seq)
+    # 无断裂时记录恰为 1..through_seq（条数超长在校验阶段已被拒绝），
+    # 末条即 through_seq 对应记录，与客户端另存的末端链值恒定时间比较。
+    tail_matches = broken is None and _equal_hex_digest(
+        records[through_seq - 1].chain_value, tail_chain_value
+    )
+    return VerifyPackageOut(
+        through_seq=through_seq,
+        valid=tail_matches,
+        first_broken_id=broken,
+        tail_chain_value_matches=tail_matches,
     )
 
 

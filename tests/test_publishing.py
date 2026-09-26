@@ -198,6 +198,45 @@ def test_get_credential_missing_returns_none(db: str) -> None:
     assert publishing.get_credential(1, path=db) is None
 
 
+def _publish_three(db: str) -> None:
+    for length in (1, 2, 3):
+        publishing.publish_credential(
+            "█" * length + "abc"[length:],
+            [(0, length)],
+            publishing.salted_text_digest("abc"),
+            path=db,
+        )
+
+
+def test_export_returns_ordered_records_through_tail(db: str) -> None:
+    _publish_three(db)
+    records = publishing.export_credentials_through(2, path=db)
+    assert records is not None
+    assert [r.seq for r in records] == [1, 2]
+    # 与逐条读取的内容一致
+    assert records[1] == publishing.get_credential(2, path=db)
+
+
+def test_export_missing_tail_returns_none(db: str) -> None:
+    assert publishing.export_credentials_through(1, path=db) is None
+    _publish_three(db)
+    assert publishing.export_credentials_through(4, path=db) is None
+
+
+def test_export_with_gap_still_returns_existing_records(db: str) -> None:
+    _publish_three(db)
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM redaction_publish WHERE seq = 2")
+    conn.commit()
+    conn.close()
+
+    records = publishing.export_credentials_through(3, path=db)
+    assert records is not None
+    assert [r.seq for r in records] == [1, 3]
+    # 缺口由核验方检出：首个断裂编号为 2
+    assert publishing.first_chain_break(records, 3) == 2
+
+
 def test_init_db_is_idempotent(db: str) -> None:
     publishing.init_db(db)
     publishing.init_db(db)
