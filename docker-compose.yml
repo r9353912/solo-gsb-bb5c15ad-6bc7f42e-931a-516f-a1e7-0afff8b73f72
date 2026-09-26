@@ -1,0 +1,22 @@
+services:
+  redaction-api:
+    build: .
+    image: sensitive-fragment-redaction:latest
+    container_name: sensitive-fragment-redaction
+    ports:
+      - "8000:8000"
+    environment:
+      REDACTION_DB_PATH: /data/redaction.db
+    volumes:
+      # 脱敏凭证 SQLite 数据持久化到命名卷；容器删除/重建后凭证链仍在
+      - redaction-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); assert json.load(r)['status']=='ok'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  redaction-data:
